@@ -2,6 +2,7 @@
 #define RENDER_EGL_H
 
 #include <wlr/render/egl.h>
+#include "util/wlr-egl-ext.h"
 
 struct wlr_egl {
 	EGLDisplay display;
