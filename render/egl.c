@@ -478,28 +478,6 @@ static EGLDeviceEXT get_egl_device_from_drm_fd(struct wlr_egl *egl,
 	return egl_device;
 }
 
-static int open_render_node(int drm_fd) {
-	char *render_name = drmGetRenderDeviceNameFromFd(drm_fd);
-	if (render_name == NULL) {
-		// This can happen on split render/display platforms, fallback to
-		// primary node
-		render_name = drmGetPrimaryDeviceNameFromFd(drm_fd);
-		if (render_name == NULL) {
-			wlr_log_errno(WLR_ERROR, "drmGetPrimaryDeviceNameFromFd failed");
-			return -1;
-		}
-		wlr_log(WLR_DEBUG, "DRM device '%s' has no render node, "
-			"falling back to primary node", render_name);
-	}
-
-	int render_fd = open(render_name, O_RDWR | O_CLOEXEC);
-	if (render_fd < 0) {
-		wlr_log_errno(WLR_ERROR, "Failed to open DRM node '%s'", render_name);
-	}
-	free(render_name);
-	return render_fd;
-}
-
 struct wlr_egl *wlr_egl_create_with_drm_fd(int drm_fd) {
 	struct wlr_egl *egl = egl_create();
 	if (egl == NULL) {
@@ -526,15 +504,9 @@ struct wlr_egl *wlr_egl_create_with_drm_fd(int drm_fd) {
 	}
 
 	if (egl->exts.KHR_platform_gbm) {
-		int gbm_fd = open_render_node(drm_fd);
-		if (gbm_fd < 0) {
-			wlr_log(WLR_ERROR, "Failed to open DRM render node");
-			goto error;
-		}
-
-		egl->gbm_device = gbm_create_device(gbm_fd);
+		egl->gbm_device = gbm_create_device(drm_fd);
 		if (!egl->gbm_device) {
-			close(gbm_fd);
+			close(drm_fd);
 			wlr_log(WLR_ERROR, "Failed to create GBM device");
 			goto error;
 		}
@@ -545,7 +517,7 @@ struct wlr_egl *wlr_egl_create_with_drm_fd(int drm_fd) {
 		}
 
 		gbm_device_destroy(egl->gbm_device);
-		close(gbm_fd);
+		close(drm_fd);
 	} else {
 		wlr_log(WLR_DEBUG, "KHR_platform_gbm not supported");
 	}
@@ -890,99 +862,6 @@ static bool device_has_name(const drmDevice *device, const char *name) {
 	return false;
 }
 
-static char *get_render_name(const char *name) {
-	uint32_t flags = 0;
-	int devices_len = drmGetDevices2(flags, NULL, 0);
-	if (devices_len < 0) {
-		wlr_log(WLR_ERROR, "drmGetDevices2 failed: %s", strerror(-devices_len));
-		return NULL;
-	}
-	drmDevice **devices = calloc(devices_len, sizeof(drmDevice *));
-	if (devices == NULL) {
-		wlr_log_errno(WLR_ERROR, "Allocation failed");
-		return NULL;
-	}
-	devices_len = drmGetDevices2(flags, devices, devices_len);
-	if (devices_len < 0) {
-		free(devices);
-		wlr_log(WLR_ERROR, "drmGetDevices2 failed: %s", strerror(-devices_len));
-		return NULL;
-	}
-
-	const drmDevice *match = NULL;
-	for (int i = 0; i < devices_len; i++) {
-		if (device_has_name(devices[i], name)) {
-			match = devices[i];
-			break;
-		}
-	}
-
-	char *render_name = NULL;
-	if (match == NULL) {
-		wlr_log(WLR_ERROR, "Cannot find DRM device %s", name);
-	} else if (!(match->available_nodes & (1 << DRM_NODE_RENDER))) {
-		// Likely a split display/render setup. Pick the primary node and hope
-		// Mesa will open the right render node under-the-hood.
-		wlr_log(WLR_DEBUG, "DRM device %s has no render node, "
-			"falling back to primary node", name);
-		assert(match->available_nodes & (1 << DRM_NODE_PRIMARY));
-		render_name = strdup(match->nodes[DRM_NODE_PRIMARY]);
-	} else {
-		render_name = strdup(match->nodes[DRM_NODE_RENDER]);
-	}
-
-	for (int i = 0; i < devices_len; i++) {
-		drmFreeDevice(&devices[i]);
-	}
-	free(devices);
-
-	return render_name;
-}
-
 int wlr_egl_dup_drm_fd(struct wlr_egl *egl) {
-	if (egl->device == EGL_NO_DEVICE_EXT || (!egl->exts.EXT_device_drm &&
-			!egl->exts.EXT_device_drm_render_node)) {
-		return -1;
-	}
-
-	char *render_name = NULL;
-#ifdef EGL_EXT_device_drm_render_node
-	if (egl->exts.EXT_device_drm_render_node) {
-		const char *name = egl->procs.eglQueryDeviceStringEXT(egl->device,
-			EGL_DRM_RENDER_NODE_FILE_EXT);
-		if (name == NULL) {
-			wlr_log(WLR_DEBUG, "EGL device has no render node");
-			return -1;
-		}
-		render_name = strdup(name);
-	}
-#endif
-
-	if (render_name == NULL) {
-		const char *primary_name = egl->procs.eglQueryDeviceStringEXT(egl->device,
-			EGL_DRM_DEVICE_FILE_EXT);
-		if (primary_name == NULL) {
-			wlr_log(WLR_ERROR,
-				"eglQueryDeviceStringEXT(EGL_DRM_DEVICE_FILE_EXT) failed");
-			return -1;
-		}
-
-		render_name = get_render_name(primary_name);
-		if (render_name == NULL) {
-			wlr_log(WLR_ERROR, "Can't find render node name for device %s",
-				primary_name);
-			return -1;
-		}
-	}
-
-	int render_fd = open(render_name, O_RDWR | O_NONBLOCK | O_CLOEXEC);
-	if (render_fd < 0) {
-		wlr_log_errno(WLR_ERROR, "Failed to open DRM render node %s",
-			render_name);
-		free(render_name);
-		return -1;
-	}
-	free(render_name);
-
-	return render_fd;
+	return gbm_device_get_fd(egl->gbm_device);
 }
